@@ -5,9 +5,9 @@
 resource "aws_autoscaling_group" "web" {
   name = "auto-healing-web-asg"
 
-  min_size         = 2
-  max_size         = 3
-  desired_capacity = 2
+  min_size         = var.min_size
+  max_size         = var.max_size
+  desired_capacity = var.desired_capacity
 
   vpc_zone_identifier = [
     aws_subnet.public_1.id,

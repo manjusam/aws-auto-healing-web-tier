@@ -15,7 +15,7 @@ resource "aws_launch_template" "web" {
   name = "auto-healing-web-lt"
 
   image_id      = data.aws_ssm_parameter.al2023_ami.value
-  instance_type = "t3.micro"
+  instance_type = var.instance_type
 
   vpc_security_group_ids = [
     aws_security_group.ec2.id
