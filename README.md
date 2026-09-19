@@ -14,13 +14,16 @@ flowchart TD
 
     ALB --> TG[Target Group]
 
-    TG --> EC2A[EC2 - NGINX<br/>Availability Zone 2a]
-    TG --> EC2B[EC2 - NGINX<br/>Availability Zone 2b]
+    TG --> EC2A[EC2 - Docker - NGINX<br/>Availability Zone 2a]
+    TG --> EC2B[EC2 - Docker - NGINX<br/>Availability Zone 2b]
 
     ASG[Auto Scaling Group<br/>Min: 2 / Desired: 2 / Max: 3] --> EC2A
     ASG --> EC2B
 
-    LT[Launch Template<br/>Amazon Linux 2023<br/>NGINX User Data] --> ASG
+    LT[Launch Template<br/>Amazon Linux 2023<br/>Docker User Data] --> ASG
+
+    GHCR[GitHub Container Registry<br/>Public Docker Image] --> EC2A
+    GHCR --> EC2B
 
     EC2A --> SUB1[Public Subnet 1]
     EC2B --> SUB2[Public Subnet 2]
@@ -37,7 +40,11 @@ The Application Load Balancer is the public entry point for the application. HTT
 
 The Auto Scaling Group maintains a desired capacity of two EC2 instances across two Availability Zones. If an instance is terminated or becomes unhealthy, the Auto Scaling Group launches a replacement using the Launch Template.
 
-Each EC2 instance is automatically configured using user data, which installs and starts NGINX.
+Each EC2 instance is automatically configured using user data. The bootstrap script installs and starts Docker, pulls the public NGINX container image from GitHub Container Registry (GHCR), and runs the container on port 80.
+
+The Docker image contains the custom static web page and is published at:
+
+`ghcr.io/manjusam/auto-healing-web:latest`
 
 The EC2 security group accepts HTTP traffic only from the Application Load Balancer security group, rather than allowing direct HTTP access from the internet.
 
@@ -83,7 +90,11 @@ AWS provides the services required for the architecture, including EC2, Applicat
 
 - **Launch Template** – Defines how EC2 instances are created, including the Amazon Linux 2023 AMI, instance type, security group and user data.
 
-- **User Data** – Automatically installs, enables and starts NGINX whenever a new EC2 instance is launched.
+- **User Data** – Automatically installs and starts Docker, pulls the public container image from GHCR, and runs the NGINX container on port 80 whenever a new EC2 instance is launched.
+
+- **Docker** – Packages NGINX and the custom static web page into a consistent container image.
+
+- **GitHub Container Registry (GHCR)** – Stores the public Docker image at `ghcr.io/manjusam/auto-healing-web:latest`, allowing new EC2 instances to pull the image without storing GitHub credentials on the instances.
 
 - **Auto Scaling Group (ASG)** – Maintains the required EC2 capacity and automatically launches replacement instances when necessary.
 
@@ -169,7 +180,13 @@ Launch Template
 New EC2 instance
           |
           v
-User data installs and starts NGINX
+User data installs and starts Docker
+          |
+          v
+Docker pulls the public image from GHCR
+          |
+          v
+NGINX container starts on port 80
           |
           v
 Target Group health check
@@ -198,7 +215,9 @@ The Terraform configuration is separated into files based on responsibility:
 ├── alb.tf
 ├── launch_template.tf
 ├── autoscaling.tf
-└── outputs.tf
+├── outputs.tf
+├── Dockerfile
+└── index.html
 ```
 
 - `main.tf` – Terraform and AWS provider configuration.
@@ -206,9 +225,47 @@ The Terraform configuration is separated into files based on responsibility:
 - `vpc.tf` – VPC, subnets, Internet Gateway and routing.
 - `security_groups.tf` – ALB and EC2 security groups.
 - `alb.tf` – Application Load Balancer, listener and target group.
-- `launch_template.tf` – EC2 Launch Template, Amazon Linux AMI lookup and NGINX user data.
+- `launch_template.tf` – EC2 Launch Template, Amazon Linux AMI lookup and user data used to install Docker and run the container image.
 - `autoscaling.tf` – Auto Scaling Group configuration.
 - `outputs.tf` – Application Load Balancer DNS output.
+- `Dockerfile` – Defines the NGINX container image and copies the custom static web page into the image.
+- `index.html` – Custom static web page served by NGINX.
+
+## Docker Bonus
+
+The web application is containerised using Docker rather than installing NGINX directly on the EC2 instances.
+
+The `Dockerfile` uses the lightweight `nginx:alpine` base image and copies the custom `index.html` page into the NGINX web root.
+
+```dockerfile
+FROM nginx:alpine
+
+COPY index.html /usr/share/nginx/html/index.html
+```
+
+The image was built and tested locally before being published to GitHub Container Registry (GHCR).
+
+```bash
+docker build -t auto-healing-web .
+docker run -d -p 8080:80 --name auto-healing-test auto-healing-web
+```
+
+The container image is published as a public package:
+
+```text
+ghcr.io/manjusam/auto-healing-web:latest
+```
+
+The EC2 Launch Template uses user data to automatically:
+
+1. Install Docker.
+2. Enable and start the Docker service.
+3. Pull the public image from GHCR.
+4. Run the container with host port 80 mapped to container port 80.
+
+Because the GHCR package is public, the EC2 instances can pull the image without storing GitHub credentials or a Personal Access Token on the instances.
+
+The container is started with `--restart unless-stopped` so that Docker can automatically restart the application container following a Docker service or instance restart unless the container has been explicitly stopped.
 
 ## Prerequisites
 
@@ -281,7 +338,7 @@ The value can also be retrieved using:
 terraform output -raw alb_dns_name
 ```
 
-Open the ALB DNS name using HTTP in a web browser to view the NGINX welcome page.
+Open the ALB DNS name using HTTP in a web browser to view the custom NGINX web page running from the Docker container.
 
 ## Validation
 
@@ -323,6 +380,31 @@ The replacement instance:
 
 The Auto Scaling activity history confirmed that a new instance was launched in response to the terminated instance.
 
+### Docker Deployment Validation
+
+After the Docker image was published to GHCR, the Launch Template user data was updated to install Docker, pull the public image and run the NGINX container.
+
+The existing EC2 instances were replaced one at a time so that a healthy instance remained available behind the Application Load Balancer during each replacement.
+
+After replacement:
+
+```text
+EC2 Instance 1 -> Healthy -> InService -> ap-southeast-2a
+EC2 Instance 2 -> Healthy -> InService -> ap-southeast-2b
+```
+
+Both replacement instances passed the target group health checks.
+
+The Application Load Balancer successfully served the custom containerised web page:
+
+```text
+AWS Auto-Healing Web Tier
+Running on NGINX in Docker
+Provisioned with Terraform
+```
+
+This verified that new instances can bootstrap automatically, retrieve the public container image from GHCR, run NGINX in Docker and become healthy targets behind the load balancer.
+
 ### Terraform Idempotency
 
 After the self-healing process completed, another Terraform plan was executed.
@@ -339,24 +421,32 @@ This demonstrates that the Terraform configuration remained aligned with the des
 
 This architecture was designed primarily to demonstrate the availability and self-healing requirements of the assessment.
 
-The main chargeable resources are:
+The approximate monthly cost for running the complete environment continuously in the Sydney (`ap-southeast-2`) region is:
 
-- Two EC2 instances
-- Application Load Balancer
-- EBS storage
-- Public IPv4 addressing
-- Load Balancer Capacity Unit (LCU) usage where applicable
+| Resource | Configuration | Approximate Monthly Cost (USD) |
+|---|---|---:|
+| EC2 | 2 × `t3.micro` Linux instances | ~$19 |
+| Application Load Balancer | 1 ALB, before significant LCU usage | ~$18+ |
+| Public IPv4 | Public addresses used by EC2/ALB | ~$14 |
+| EBS | Root volumes for two EC2 instances | ~$2 |
+| **Estimated total** | Light assessment traffic | **~$53+ USD/month** |
 
-Running the complete architecture continuously in the Sydney region is expected to exceed the assessment target of AUD 20 per month at standard on-demand pricing.
+This is approximately **AUD 70–80 per month**, depending on the USD/AUD exchange rate, traffic, taxes and other usage-based charges.
 
-For this reason, the environment is intended to be short-lived for assessment and validation purposes and should be destroyed after testing.
+The estimate assumes that the infrastructure runs continuously for approximately 730 hours per month with light assessment traffic. Application Load Balancer LCU usage and data transfer can increase the final cost.
 
-A production deployment would require a separate cost review and optimisation based on workload requirements.
+The complete architecture therefore exceeds the assessment target of AUD 20 per month when operated continuously.
+
+The main reason is that the assessment requires N+1 capacity with at least two instances behind a load balancer. The Application Load Balancer and public IPv4 addressing also introduce fixed ongoing costs.
+
+For this assessment, the environment is intended to be short-lived. It is deployed only for implementation and validation and is destroyed afterward using Terraform to avoid unnecessary ongoing charges.
+
+A production deployment would require a separate cost optimisation exercise based on availability, security, traffic and workload requirements.
 
 ## Assumptions
 
 - HTTP is sufficient for the assessment; HTTPS and certificates are outside the current scope.
-- The default NGINX welcome page is sufficient to demonstrate the web tier.
+- A custom static NGINX page running in Docker is used to demonstrate the web tier.
 - Two EC2 instances satisfy the required N+1 capacity for this assessment.
 - EC2 instances are deployed in public subnets to simplify the assessment architecture and avoid NAT Gateway cost.
 - The environment is intended for demonstration/testing rather than continuous production use.
@@ -388,7 +478,10 @@ This project demonstrates an AWS web tier that is:
 - Distributed across two Availability Zones.
 - Load balanced through an Application Load Balancer.
 - Protected using separate ALB and EC2 security groups.
-- Automatically configured with NGINX using EC2 user data.
-- Maintained by an Auto Scaling Group.
-- Able to automatically replace a terminated instance.
-- Idempotent when Terraform is run again without configuration changes.
+- Maintained by an Auto Scaling Group with a desired capacity of two instances.
+- Able to automatically replace a terminated or unhealthy instance.
+- Containerised using Docker and NGINX.
+- Automatically bootstrapped using EC2 user data.
+- Able to pull the public Docker image from GitHub Container Registry (GHCR) and run it on newly launched instances.
+- Verified with two healthy Docker-based EC2 targets behind the Application Load Balancer.
+- Idempotent, with the final `terraform plan` returning no infrastructure changes.

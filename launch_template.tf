@@ -22,14 +22,22 @@ resource "aws_launch_template" "web" {
   ]
 
   user_data = base64encode(<<-EOF
-    #!/bin/bash
+  #!/bin/bash
 
-    dnf update -y
-    dnf install -y nginx
+  dnf update -y
+  dnf install -y docker
 
-    systemctl enable nginx
-    systemctl start nginx
-  EOF
+  systemctl enable docker
+  systemctl start docker
+
+  docker pull ghcr.io/manjusam/auto-healing-web:latest
+
+  docker run -d \
+    --restart unless-stopped \
+    --name auto-healing-web \
+    -p 80:80 \
+    ghcr.io/manjusam/auto-healing-web:latest
+EOF
   )
 
   tag_specifications {
